@@ -1,0 +1,528 @@
+---
+title: "Trajectory analysis (revisited)"
+author: "James Ashmore"
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+output: workflowr::wflow_html
+editor_options:
+  chunk_output_type: console
+---
+
+## Setup
+
+Set chunk options:
+
+```{r}
+knitr::opts_chunk$set(
+  autodep    = TRUE,
+  cache      = TRUE,
+  cache.path = "cache/07-trajectory-analysis-revisited.Rmd/",
+  cache.lazy = FALSE,
+  dev        = "png",
+  error      = FALSE,
+  message    = FALSE,
+  warning    = FALSE
+)
+```
+
+Load required packages:
+
+```{r}
+pkg <- c("BiocNeighbors", "EnsDb.Mmusculus.v79", "MouseGastrulationData", "RColorBrewer", "SingleCellExperiment", "cluster", "scater", "scran", "slingshot", "ggbeeswarm", "pheatmap", "ggbeeswarm")
+
+lib <- lapply(pkg, library, character.only = TRUE)
+```
+
+Create colour palettes:
+
+```{r}
+EmbryoGenotypeColours <- c("wt" = "#7fc97f", "kdr" = "#f0027f")
+
+EmbryoSourceColours = c("allantois" = "#386cb0", "atlas" = "#beaed4")
+```
+
+Create nicer labels:
+
+```{r}
+EmbryoGenotypeLabels <- c("wt" = "WT", "kdr" = "KO")
+
+EmbryoSourceLabels <- c("allantois" = "Allantois", "atlas" = "Atlas")
+
+EmbryoNeighborLabels <- c("TRUE" = "Neighbor", "FALSE" = "Non-Neighbor")
+```
+
+## Processing
+
+Read experiment data:
+
+```{r}
+mnn <- readRDS("data/02-atlas-integration.rds")
+```
+
+Get feature name for each identifier:
+
+```{r}
+rowData(mnn)$gene_id <- rownames(mnn)
+
+rowData(mnn)$gene_name <- mapIds(EnsDb.Mmusculus.v79, keys = rownames(mnn), column = "GENENAME", keytype = "GENEID")
+
+rowData(mnn)$gene_name[rowData(mnn)$gene_name == ""] <- NA
+```
+
+Make feature names unique:
+
+```{r}
+rownames(mnn) <- uniquifyFeatureNames(rowData(mnn)$gene_id, rowData(mnn)$gene_name)
+```
+
+## Nearest neighbors
+
+Query k-nearest neighbors to each allantois cell:
+
+```{r}
+set.seed(503179283)
+
+dim <- reducedDim(mnn, "corrected")
+
+sbj <- dim[mnn$source == "atlas", ]
+
+qry <- dim[mnn$source == "allantois", ]
+
+knn <- queryKNN(sbj, qry, k = 1)
+
+idx <- unique(as.vector(knn$index))
+
+ids <- rownames(sbj)[idx]
+
+lgl <- colnames(mnn) %in% ids
+
+mnn$neighbor <- ifelse(lgl, TRUE, FALSE)
+```
+
+Create plotting data for exploration:
+
+```{r}
+dim <- reducedDim(mnn, "UMAP")
+
+colnames(dim) <- c("X", "Y")
+
+dat <- as.data.frame(mnn@colData)
+
+tbl <- cbind(dim, dat)
+
+bgd <- as.data.frame(dim)
+```
+
+Plot UMAP projection coloured by celltype / facetted by neighbor and source:
+
+```{r fig.width = 14, fig.height = 9}
+ggplot(tbl, aes(X, Y)) + 
+  geom_point(data = bgd, colour = "gainsboro", size = 0.1) + 
+  geom_point(mapping = aes(colour = celltype), size = 0.1) + 
+  scale_colour_manual(name = "Celltype", values = EmbryoCelltypeColours) + 
+  guides(colour = guide_legend(ncol = 1, override.aes = list(size = 2))) + 
+  facet_grid(neighbor ~ source, labeller = labeller(neighbor = EmbryoNeighborLabels, source = EmbryoSourceLabels)) +
+  theme_bw() +
+  theme(aspect.ratio = 1, axis.title = element_blank())
+```
+
+Plot UMAP projection coloured by genotype / facetted by neighbor and source:
+
+```{r fig.width = 14, fig.height = 9}
+ggplot(tbl, aes(X, Y)) + 
+  geom_point(data = bgd, colour = "gainsboro", size = 0.1) + 
+  geom_point(mapping = aes(colour = genotype), size = 0.1) + 
+  scale_colour_manual(name = "Genotype", values = EmbryoGenotypeColours, labels = EmbryoGenotypeLabels) + 
+  guides(colour = guide_legend(ncol = 1, override.aes = list(size = 2))) + 
+  facet_grid(neighbor ~ source, labeller = labeller(neighbor = EmbryoNeighborLabels, source = EmbryoSourceLabels)) +
+  theme_bw() +
+  theme(aspect.ratio = 1, axis.title = element_blank())
+```
+
+## Diffusion Map
+
+Select wild-type allantois and k-nearest neighbor cells:
+
+```{r}
+id1 <- mnn$source == "allantois"
+
+id2 <- mnn$neighbor == TRUE
+
+sel <- id1 | id2
+
+sce <- mnn[, sel]
+```
+
+Create a diffusion map of cells from the batch-corrected PCA matrix:
+
+```{r}
+set.seed(312898858)
+
+sce <- runDiffusionMap(sce, dimred = "corrected")
+```
+
+Identify 'optimal' number of clusters to build a minimum spanning tree in slingshot:
+
+```{r}
+set.seed(695895185)
+
+dim <- reducedDim(sce, "DiffusionMap")
+
+fit <- clusGap(dim, kmeans, K.max = 20)
+
+num <- maxSE(fit$Tab[, "gap"], fit$Tab[, "SE.sim"])
+```
+
+Cluster the selected cell types to achieve a more granular trajectory:
+
+```{r}
+set.seed(231362263)
+
+dim <- reducedDim(sce, "DiffusionMap")
+
+fit <- kmeans(dim, centers = 8)
+
+sce$cluster <- factor(fit$cluster)
+```
+
+Setup colour palette for clusters:
+
+```{r}
+EmbryoClusterColours <- brewer.pal(nlevels(sce$cluster), name = "Set3")
+
+names(EmbryoClusterColours) <- levels(sce$cluster)
+```
+
+Create plotting data for exploration:
+
+```{r fig.width = 7.0, fig.height = 4.5}
+dim <- reducedDim(sce, "DiffusionMap")
+
+colnames(dim) <- c("X", "Y")
+
+dat <- as.data.frame(sce@colData)
+
+tbl <- cbind(dim, dat)
+
+bgd <- as.data.frame(dim)
+```
+
+Plot DiffusionMap projection coloured by cluster / facetted by genotype and source:
+
+```{r fig.width = 7.0, fig.height = 4.5}
+ggplot(tbl, aes(X, Y)) + 
+  geom_point(data = bgd, colour = "gainsboro", size = 2) + 
+  geom_point(mapping = aes(colour = cluster), size = 2) + 
+  scale_colour_manual(name = "Cluster", values = EmbryoClusterColours) + 
+  guides(colour = guide_legend(ncol = 1, override.aes = list(size = 2))) + 
+  facet_grid(genotype ~ source, labeller = labeller(genotype = EmbryoGenotypeLabels, source = EmbryoSourceLabels)) +
+  theme_bw() +
+  theme(aspect.ratio = 1, axis.title = element_blank())
+```
+
+Plot DiffusionMap projection coloured by celltype / facetted by genotype and source:
+
+```{r fig.width = 7.0, fig.height = 4.5}
+ggplot(tbl, aes(X, Y)) + 
+  geom_point(data = bgd, colour = "gainsboro", size = 2) + 
+  geom_point(mapping = aes(colour = celltype), size = 2) + 
+  scale_colour_manual(name = "Celltype", values = EmbryoCelltypeColours) + 
+  guides(colour = guide_legend(ncol = 1, override.aes = list(size = 2))) + 
+  facet_grid(genotype ~ source, labeller = labeller(genotype = EmbryoGenotypeLabels, source = EmbryoSourceLabels)) +
+  theme_bw() +
+  theme(aspect.ratio = 1, axis.title = element_blank())
+```
+
+## Slingshot
+
+Perform lineage inference with Slingshot:
+
+```{r}
+sce <- slingshot(
+  data = sce,
+  clusterLabels = sce$cluster,
+  reducedDim = "DiffusionMap",
+  start.clus = 5
+)
+```
+
+Create SlingshotDataSet from SingleCellExperiment object:
+
+```{r}
+sds <- SlingshotDataSet(sce)
+```
+
+Create plotting data for exploration:
+
+```{r}
+dim <- reducedDim(sce, "DiffusionMap")
+
+colnames(dim) <- c("X", "Y")
+
+dat <- as.data.frame(sce@colData)
+
+tbl <- cbind(dim, dat)
+
+sc1 <- as.data.frame(sds@curves$curve1$s[sds@curves$curve1$ord, ])
+
+colnames(sc1) <- c("X", "Y")
+
+sc2 <- as.data.frame(sds@curves$curve2$s[sds@curves$curve2$ord, ])
+
+colnames(sc2) <- c("X", "Y")
+
+sc3 <- as.data.frame(sds@curves$curve3$s[sds@curves$curve3$ord, ])
+
+colnames(sc3) <- c("X", "Y")
+```
+
+Plot DiffusionMap with lineage 1 coloured by pseudotime:
+
+```{r fig.width = 7.0, fig.height = 4.5}
+ggplot(tbl, aes(X, Y)) + 
+  geom_point(aes(fill = slingPseudotime_1), size = 3, shape = 21) + 
+  scale_fill_viridis_c(name = "Pseudotime", option = "viridis") +  
+  geom_path(data = sc1, aes(X, Y), size = 1.5, arrow = arrow()) + 
+  labs(x = "DC1", y = "DC2") + 
+  theme_bw() +
+  theme(aspect.ratio = 1)
+```
+
+Plot DiffusionMap with lineage 2 coloured by pseudotime:
+
+```{r fig.width = 7.0, fig.height = 4.5}
+ggplot(tbl, aes(X, Y)) + 
+  geom_point(aes(fill = slingPseudotime_2), size = 3, shape = 21) + 
+  scale_fill_viridis_c(name = "Pseudotime", option = "viridis") +  
+  geom_path(data = sc2, aes(X, Y), size = 1.5, arrow = arrow()) + 
+  labs(x = "DC1", y = "DC2") + 
+  theme_bw() +
+  theme(aspect.ratio = 1)
+```
+
+Plot DiffusionMap with lineage 3 coloured by pseudotime:
+
+```{r fig.width = 7.0, fig.height = 4.5}
+ggplot(tbl, aes(X, Y)) + 
+  geom_point(aes(fill = slingPseudotime_3), size = 3, shape = 21) + 
+  scale_fill_viridis_c(name = "Pseudotime", option = "viridis") +  
+  geom_path(data = sc3, aes(X, Y), size = 1.5, arrow = arrow()) + 
+  labs(x = "DC1", y = "DC2") + 
+  theme_bw() +
+  theme(aspect.ratio = 1)
+```
+
+
+
+Plot DiffusionMap with lineages and coloured by cluster:
+
+```{r fig.width = 7.0, fig.height = 4.5}
+ggplot(tbl, aes(X, Y)) + 
+  geom_point(aes(fill = cluster), size = 3, shape = 21) + 
+  scale_fill_manual(name = "Cluster", values = EmbryoClusterColours) + 
+  geom_path(data = sc1, aes(X, Y), size = 1.5, arrow = arrow()) + 
+  geom_path(data = sc2, aes(X, Y), size = 1.5, arrow = arrow()) + 
+  geom_path(data = sc3, aes(X, Y), size = 1.5, arrow = arrow()) + 
+  labs(x = "DC1", y = "DC2") + 
+  theme_bw() +
+  theme(aspect.ratio = 1)
+```
+
+Plot DiffusionMap with lineages and coloured by celltype:
+
+```{r fig.width = 7.0, fig.height = 4.5}
+ggplot(tbl, aes(X, Y)) + 
+  geom_point(aes(fill = celltype), size = 3, shape = 21) + 
+  scale_fill_manual(name = "Celltype", values = EmbryoCelltypeColours) + 
+  geom_path(data = sc1, aes(X, Y), size = 1.5, arrow = arrow()) + 
+  geom_path(data = sc2, aes(X, Y), size = 1.5, arrow = arrow()) + 
+  geom_path(data = sc3, aes(X, Y), size = 1.5, arrow = arrow()) + 
+  labs(x = "DC1", y = "DC2") + 
+  theme_bw() +
+  theme(aspect.ratio = 1)
+```
+
+Plot DiffusionMap with lineages and coloured by genotype:
+
+```{r fig.width = 7.0, fig.height = 4.5}
+ggplot(tbl, aes(X, Y)) + 
+  geom_point(aes(fill = genotype), size = 3, shape = 21) + 
+  scale_fill_manual(name = "Genotype", values = EmbryoGenotypeColours, labels = EmbryoGenotypeLabels) + 
+  geom_path(data = sc1, aes(X, Y), size = 1.5, arrow = arrow()) + 
+  geom_path(data = sc2, aes(X, Y), size = 1.5, arrow = arrow()) + 
+  labs(x = "DC1", y = "DC2") + 
+  theme_bw() +
+  theme(aspect.ratio = 1)
+```
+
+Plot cells ordered by pseudotime 1 and coloured by celltype / facetted by source:
+
+```{r fig.width = 7.0, fig.height = 4.5}
+ggplot(tbl, aes(slingPseudotime_1, genotype, colour = celltype)) + 
+  geom_quasirandom(groupOnX = FALSE) + 
+  scale_colour_manual(name = "Celltype", values = EmbryoCelltypeColours) + 
+  scale_y_discrete(labels = EmbryoGenotypeLabels) + 
+  facet_wrap(~ source, labeller = labeller(source = EmbryoSourceLabels)) + 
+  labs(title = "Lineage 1", x = "Slingshot pseudotime", y = "Genotype") + 
+  theme_bw() +
+  theme(aspect.ratio = 1)
+```
+
+Plot cells ordered by pseudotime 2 and coloured by celltype / facetted by source:
+
+```{r fig.width = 7.0, fig.height = 4.5}
+ggplot(tbl, aes(slingPseudotime_2, genotype, colour = celltype)) + 
+  geom_quasirandom(groupOnX = FALSE) + 
+  scale_colour_manual(name = "Celltype", values = EmbryoCelltypeColours) + 
+  scale_y_discrete(labels = EmbryoGenotypeLabels) + 
+  facet_wrap(~ source, labeller = labeller(source = EmbryoSourceLabels)) + 
+  labs(title = "Lineage 2", x = "Slingshot pseudotime", y = "Genotype") + 
+  theme_bw() +
+  theme(aspect.ratio = 1, axis.title = element_blank())
+```
+
+## Pseudotime correlation
+
+Create function to identify genes that are significantly correlated with pseudotime:
+
+```{r}
+correlateTime <- function(x, column, alpha = 0.01) {
+  
+  nan <- is.na(x[[column]])
+
+  x <- x[, !nan]
+  
+  mat <- assay(x, "logcounts") # use logcounts
+
+  mat <- as.matrix(mat)
+
+  mat <- rbind(mat, pseudotime = x[[column]])
+
+  idx <- list("pseudotime", rownames(mat))
+  
+  res <- correlatePairs(mat, block = x$batch, pairings = idx) # block on batch
+
+  sig <- subset(res, FDR < alpha)
+  
+  return(sig)
+
+}
+```
+
+Identify genes correlated with lineage 1 pseudotime:
+
+```{r}
+set.seed(19167957)
+
+de1 <- correlateTime(sce[,  !is.na(sce$slingPseudotime_1)], column = "slingPseudotime_1", alpha = 0.05)
+
+DT::datatable(as.data.frame(de1))
+```
+
+Identify genes correlated with lineage 2 pseudotime:
+
+```{r}
+set.seed(605782840)
+
+de2 <- correlateTime(sce[,  !is.na(sce$slingPseudotime_2)], column = "slingPseudotime_2", alpha = 0.05)
+
+DT::datatable(as.data.frame(de2))
+```
+
+Identify genes correlated with lineage 3 pseudotime:
+
+```{r}
+set.seed(605782840)
+
+de3 <- correlateTime(sce[,  !is.na(sce$slingPseudotime_3)], column = "slingPseudotime_3", alpha = 0.05)
+
+DT::datatable(as.data.frame(de3))
+```
+
+Save results table of significant genes for downstream analysis:
+
+```{r}
+metadata(sce)$correlateTime <- list(slingPseudotime_1 = de1, slingPseudotime_2 = de2, slingPseudotime_3 = de3)
+```
+
+Create function to plot heatmap of genes expression values ordered by pseudotime:
+
+```{r}
+plotTimeGenes <- function(x, features, columns, order_columns_by) {
+
+  obj <- x[features, columns]
+
+  mat <- t(scale(t(assay(obj, "reconstructed"))))
+
+  mat <- mat[, order(obj[[order_columns_by]])]
+
+  col <- colorRampPalette(rev(brewer.pal(5, name = "RdBu")))(100)
+
+  lim <- max(abs(mat))
+  
+  brk <- seq(-5, 5, length.out = 101)
+  
+  ann <- list(
+    
+    col = data.frame(
+      Celltype  = obj$celltype,
+      Genotype  = obj$genotype,
+      Source    = obj$source,
+      Cluster   = obj$cluster,
+      row.names = colnames(obj)
+    ),
+    
+    colors = list(
+      Celltype = EmbryoCelltypeColours[unique(obj$celltype)],
+      Genotype = EmbryoGenotypeColours[unique(obj$genotype)],
+      Source   = EmbryoSourceColours[unique(obj$source)],
+      Cluster  = EmbryoClusterColours[unique(obj$cluster)]
+    )
+  )
+
+  plt <- pheatmap(
+    mat = mat,
+    color = col, 
+    breaks = brk,
+    scale = "none",
+    cluster_cols = FALSE,
+    annotation_col = ann$col,
+    annotation_colors = ann$colors,
+    show_colnames = FALSE
+  )
+  
+  return(plt)
+
+}
+```
+
+Plot expression of 50 most significant genes correlated with lineage 1 pseudotime:
+
+```{r fig.width = 14, fig.height = 9}
+plotTimeGenes(sce, features = head(de1$gene2, n = 50), columns = complete.cases(sce$slingPseudotime_1), order_columns_by = "slingPseudotime_1")
+```
+
+Plot expression of 50 most significant genes correlated with lineage 2 pseudotime:
+
+```{r fig.width = 14, fig.height = 9}
+plotTimeGenes(sce, features = head(de2$gene2, n = 50), columns = complete.cases(sce$slingPseudotime_2), order_columns_by = "slingPseudotime_2")
+```
+
+Plot expression of 50 most significant genes correlated with lineage 3 pseudotime:
+
+```{r fig.width = 14, fig.height = 9}
+plotTimeGenes(sce, features = head(de3$gene2, n = 50), columns = complete.cases(sce$slingPseudotime_3), order_columns_by = "slingPseudotime_2")
+```
+
+## Summary
+
+Save experiment object with DiffusionMap and Slingshot results:
+
+```{r}
+saveRDS(sce, file = "data/07-trajectory-analysis-revisited.rds")
+```
+
+Print session information:
+
+```{r}
+sessionInfo()
+```

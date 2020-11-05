@@ -1,0 +1,668 @@
+---
+title: "Trajectory-based differential expression"
+author: "James Ashmore"
+date: "2020-04-21"
+output: workflowr::wflow_html
+editor_options:
+  chunk_output_type: console
+---
+
+## Setup
+
+Set chunk options:
+
+```{r}
+knitr::opts_chunk$set(
+  autodep    = TRUE,
+  cache      = TRUE,
+  cache.path = "cache/04-differential-analysis.Rmd/",
+  dev        = "png",
+  error      = FALSE,
+  message    = FALSE,
+  warning    = FALSE
+)
+```
+
+Load required packages:
+
+```{r}
+pkg <- c("MouseGastrulationData", "RColorBrewer", "SingleCellExperiment", "scater", "scran", "slingshot", "tradeSeq", "pheatmap")
+
+lib <- lapply(pkg, library, character.only = TRUE)
+```
+
+Create colour palettes:
+
+```{r}
+EmbryoGenotypeColours <- c("wt" = "#7fc97f", "kdr" = "#f0027f")
+
+EmbryoSourceColours = c("allantois" = "#386cb0", "atlas" = "#beaed4")
+```
+
+Create nicer labels:
+
+```{r}
+EmbryoGenotypeLabels <- c("wt" = "WT", "kdr" = "KO")
+
+EmbryoSourceLabels <- c("allantois" = "Allantois", "atlas" = "Atlas")
+```
+
+## Processing
+
+Read experiment data:
+
+```{r}
+sce <- readRDS("data/03-trajectory-analysis.rds")
+```
+
+Setup colour palette for clusters:
+
+```{r}
+EmbryoClusterColours <- brewer.pal(nlevels(sce$cluster), name = "Set3")
+
+names(EmbryoClusterColours) <- levels(sce$cluster)
+```
+
+Extract dataset from experiment data:
+
+```{r}
+sds <- SlingshotDataSet(sce)
+```
+
+Reshape column data for plotting and visualization:
+
+```{r}
+dat <- colData(sce)
+
+dat <- cbind(cell = rownames(dat), dat)
+
+ids <- grep("slingPseudotime", colnames(dat), invert = TRUE)
+
+dat <- reshape2::melt(as.data.frame(dat), id.vars = ids, variable.name = "lineage", value.name = "pseudotime")
+
+dat$lineage <- gsub("slingPseudotime_", "", dat$lineage)
+```
+
+Create function to plot heatmap of genes expression values ordered by pseudotime:
+
+```{r}
+plotTimeGenes <- function(x, features, columns, order_columns_by) {
+
+  obj <- x[features, columns]
+
+  mat <- t(scale(t(assay(obj, "reconstructed"))))
+
+  mat <- mat[, order(obj[[order_columns_by]])]
+
+  col <- colorRampPalette(rev(brewer.pal(5, name = "RdBu")))(100)
+
+  lim <- max(abs(mat))
+  
+  brk <- seq(-5, 5, length.out = 101)
+  
+  ann <- list(
+    
+    col = data.frame(
+      Celltype  = obj$celltype,
+      Genotype  = obj$genotype,
+      Source    = obj$source,
+      Cluster   = obj$cluster,
+      row.names = colnames(obj)
+    ),
+    
+    colors = list(
+      Celltype = EmbryoCelltypeColours[unique(obj$celltype)],
+      Genotype = EmbryoGenotypeColours[unique(obj$genotype)],
+      Source   = EmbryoSourceColours[unique(obj$source)],
+      Cluster  = EmbryoClusterColours[unique(obj$cluster)]
+    )
+  )
+
+  plt <- pheatmap(
+    mat = mat,
+    color = col, 
+    breaks = brk,
+    scale = "none",
+    cluster_cols = FALSE,
+    annotation_col = ann$col,
+    annotation_colors = ann$colors,
+    show_colnames = FALSE,
+  )
+  
+  return(plt)
+
+}
+```
+
+## Differential analysis
+
+### Linear modelling
+
+Identify 2000 most variable genes:
+  
+```{r}
+dec <- modelGeneVar(sce, block = sce$batch)
+
+hvg <- getTopHVGs(dec, n = 2000)
+
+idx <- which(rownames(sce) %in% hvg)
+```
+
+Fit the NB-GAM model to variable genes:
+  
+```{r}
+fit <- fitGAM(
+  counts = as.matrix(counts(sce)),
+  pseudotime = slingPseudotime(sds, na = FALSE),
+  cellWeights = slingCurveWeights(sds),
+  U = model.matrix(~ 0 + batch, data = sce@colData),
+  genes = idx,
+  sce = FALSE
+)
+```
+
+### Association test
+
+Test whether average gene expression is associated with pseudotime:
+  
+```{r}
+res <- associationTest(fit, lineages = TRUE)
+```
+
+Identify genes associated with lineage 1 pseudotime:
+
+```{r}
+de1 <- subset(res, p.adjust(pvalue_1, method = "fdr") < 0.05)
+
+de1 <- de1[order(de1$waldStat_1, decreasing = TRUE), ]
+
+DT::datatable(as.data.frame(de1))
+```
+
+Identify genes associated with lineage 2 pseudotime:
+
+```{r}
+de2 <- subset(res, p.adjust(pvalue_2, method = "fdr") < 0.05)
+
+de2 <- de2[order(de2$waldStat_2, decreasing = TRUE), ]
+
+DT::datatable(as.data.frame(de2))
+```
+
+Save results table of significant genes for downstream analysis:
+
+```{r}
+metadata(sce)$associationTest <- list(slingPseudotime_1 = de1, slingPseudotime_2 = de2)
+```
+
+Plot expression of 50 most significant genes associated with lineage 1 pseudotime:
+
+```{r fig.width = 14, fig.height = 9}
+plotTimeGenes(sce, features = head(rownames(de1), n = 50), columns = complete.cases(sce$slingPseudotime_1), order_columns_by = "slingPseudotime_1")
+```
+
+Plot expression of 50 most significant genes associated with lineage 2 pseudotime:
+
+```{r fig.width = 14, fig.height = 9}
+plotTimeGenes(sce, features = head(rownames(de2), n = 50), columns = complete.cases(sce$slingPseudotime_2), order_columns_by = "slingPseudotime_2")
+```
+
+### Differential start vs end test
+
+Identify differentially expressed genes between the start and end of a lineage:
+
+```{r}
+res <- startVsEndTest(fit, lineages = TRUE)
+```
+
+Extract significant genes for lineage 1 pseudotime:
+
+```{r}
+de1 <- subset(res, p.adjust(pvalue_lineage1, method = "fdr") < 0.05)
+
+de1 <- de1[order(de1$waldStat_lineage1, decreasing = TRUE), ]
+
+DT::datatable(
+  as.data.frame(de1),
+  extensions = "FixedColumns",
+  options = list(dom = 't', scrollX = TRUE, fixedColumns = TRUE)
+)
+```
+
+Extract significant genes for lineage 2 pseudotime:
+
+```{r}
+de2 <- subset(res, p.adjust(pvalue_lineage2, method = "fdr") < 0.05)
+
+de2 <- de2[order(de2$waldStat_lineage2, decreasing = TRUE), ]
+
+DT::datatable(as.data.frame(de2))
+```
+
+Save results table of significant genes for downstream analysis:
+
+```{r}
+metadata(sce)$startVsEndTest <- list(slingPseudotime_1 = de1, slingPseudotime_2 = de2)
+```
+
+Plot expression of 50 most significant genes for lineage 1 pseudotime:
+
+```{r fig.width = 14, fig.height = 9}
+plotTimeGenes(sce, features = head(rownames(de1), n = 50), columns = complete.cases(sce$slingPseudotime_1), order_columns_by = "slingPseudotime_1")
+```
+
+Plot expression of 50 most significant genes for lineage 2 pseudotime:
+
+```{r fig.width = 14, fig.height = 9}
+plotTimeGenes(sce, features = head(rownames(de2), n = 50), columns = complete.cases(sce$slingPseudotime_2), order_columns_by = "slingPseudotime_2")
+```
+
+### Differential end test
+
+Test differential expression between end points of lineages of a trajectory:
+
+```{r}
+res <- diffEndTest(fit)
+
+res <- subset(res, p.adjust(pvalue, method = "fdr") < 0.05)
+
+res <- res[order(res$waldStat, decreasing = TRUE), ]
+
+DT::datatable(as.data.frame(res))
+```
+
+Save results table of significant genes for downstream analysis:
+
+```{r}
+metadata(sce)$diffEndTest <- res
+```
+
+Plot expression of 15 most significant genes (cells coloured by lineage):
+
+```{r fig.width = 14, fig.height = 9}
+ids <- head(rownames(res), n = 15)
+
+plt <- lapply(ids, function(gene) {
+  
+  dat$expression <- assay(sce, "reconstructed")[gene, dat$cell]
+  
+  ggplot(dat, aes(pseudotime, expression, group = lineage, colour = lineage)) + 
+    geom_point() + 
+    scale_colour_brewer(palette = "Set1") + 
+    geom_smooth(colour = "black", method = "loess") + 
+    labs(title = gene, x = "Pseudotime", y = "Expression", colour = "Lineage") + 
+    theme_bw() + 
+    theme(aspect.ratio = 1)
+
+})
+
+patchwork::wrap_plots(plt, nrow = 3, ncol = 5, guides = "collect") & theme(legend.position = 'bottom')
+```
+
+Plot expression of 15 most significant genes (cells coloured by genotype):
+
+```{r fig.width = 14, fig.height = 9}
+ids <- head(rownames(res), n = 15)
+
+plt <- lapply(ids, function(gene) {
+  
+  dat$expression <- assay(sce, "reconstructed")[gene, dat$cell]
+  
+  ggplot(dat, aes(pseudotime, expression, group = lineage, colour = genotype)) + 
+    geom_point() + 
+    scale_colour_manual(values = EmbryoGenotypeColours, labels = EmbryoGenotypeLabels) + 
+    geom_smooth(colour = "black", method = "loess") + 
+    labs(title = gene, x = "Pseudotime", y = "Expression", colour = "Genotype") + 
+    theme_bw() + 
+    theme(aspect.ratio = 1)
+
+})
+
+patchwork::wrap_plots(plt, nrow = 3, ncol = 5, guides = "collect") & theme(legend.position = 'bottom')
+```
+
+Plot expression of 15 most significant genes (cells coloured by celltype):
+
+```{r fig.width = 14, fig.height = 9}
+ids <- head(rownames(res), n = 15)
+
+plt <- lapply(ids, function(gene) {
+  
+  dat$expression <- assay(sce, "reconstructed")[gene, dat$cell]
+  
+  ggplot(dat, aes(pseudotime, expression, group = lineage, colour = celltype)) + 
+    geom_point() + 
+    scale_colour_manual(values = EmbryoCelltypeColours) + 
+    geom_smooth(colour = "black", method = "loess") + 
+    labs(title = gene, x = "Pseudotime", y = "Expression", colour = "Celltype") + 
+    theme_bw() + 
+    theme(aspect.ratio = 1)
+
+})
+
+patchwork::wrap_plots(plt, nrow = 3, ncol = 5, guides = "collect") & theme(legend.position = 'bottom')
+```
+
+Plot expression of 15 most significant genes (cells coloured by cluster):
+
+```{r fig.width = 14, fig.height = 9}
+ids <- head(rownames(res), n = 15)
+
+plt <- lapply(ids, function(gene) {
+  
+  dat$expression <- assay(sce, "reconstructed")[gene, dat$cell]
+  
+  ggplot(dat, aes(pseudotime, expression, group = lineage, colour = cluster)) + 
+    geom_point() + 
+    scale_colour_manual(values = EmbryoClusterColours) + 
+    geom_smooth(colour = "black", method = "loess") + 
+    labs(title = gene, x = "Pseudotime", y = "Expression", colour = "Cluster") + 
+    theme_bw() + 
+    theme(aspect.ratio = 1)
+
+})
+
+patchwork::wrap_plots(plt, nrow = 3, ncol = 5, guides = "collect") & theme(legend.position = 'bottom')
+```
+
+Plot expression of 15 most significant genes (cells coloured by source):
+
+```{r fig.width = 14, fig.height = 9}
+ids <- head(rownames(res), n = 15)
+
+plt <- lapply(ids, function(gene) {
+  
+  dat$expression <- assay(sce, "reconstructed")[gene, dat$cell]
+  
+  ggplot(dat, aes(pseudotime, expression, group = lineage, colour = source)) + 
+    geom_point() + 
+    scale_colour_manual(values = EmbryoSourceColours, labels = EmbryoSourceLabels) + 
+    geom_smooth(colour = "black", method = "loess") + 
+    labs(title = gene, x = "Pseudotime", y = "Expression", colour = "Source") + 
+    theme_bw() + 
+    theme(aspect.ratio = 1)
+
+})
+
+patchwork::wrap_plots(plt, nrow = 3, ncol = 5, guides = "collect") & theme(legend.position = 'bottom')
+```
+
+### Differential pattern test
+
+Test differences in expression patterns between lineages:
+
+```{r}
+res <- patternTest(fit)
+
+res <- subset(res, p.adjust(pvalue, method = "fdr") < 0.05)
+
+res <- res[order(res$waldStat, decreasing = TRUE), ]
+
+DT::datatable(as.data.frame(res))
+```
+
+Save results table of significant genes for downstream analysis:
+
+```{r}
+metadata(sce)$patternTest <- res
+```
+
+Plot expression of 15 most significant genes (cells coloured by lineage):
+
+```{r fig.width = 14, fig.height = 9}
+ids <- head(rownames(res), n = 15)
+
+plt <- lapply(ids, function(gene) {
+  
+  dat$expression <- assay(sce, "reconstructed")[gene, dat$cell]
+  
+  ggplot(dat, aes(pseudotime, expression, group = lineage, colour = lineage)) + 
+    geom_point() + 
+    scale_colour_brewer(palette = "Set1") + 
+    geom_smooth(colour = "black", method = "loess") + 
+    labs(title = gene, x = "Pseudotime", y = "Expression", colour = "Lineage") + 
+    theme_bw() + 
+    theme(aspect.ratio = 1)
+
+})
+
+patchwork::wrap_plots(plt, nrow = 3, ncol = 5, guides = "collect") & theme(legend.position = 'bottom')
+```
+
+Plot expression of 15 most significant genes (cells coloured by genotype):
+
+```{r fig.width = 14, fig.height = 9}
+ids <- head(rownames(res), n = 15)
+
+plt <- lapply(ids, function(gene) {
+  
+  dat$expression <- assay(sce, "reconstructed")[gene, dat$cell]
+  
+  ggplot(dat, aes(pseudotime, expression, group = lineage, colour = genotype)) + 
+    geom_point() + 
+    scale_colour_manual(values = EmbryoGenotypeColours, labels = EmbryoGenotypeLabels) + 
+    geom_smooth(colour = "black", method = "loess") + 
+    labs(title = gene, x = "Pseudotime", y = "Expression", colour = "Genotype") + 
+    theme_bw() + 
+    theme(aspect.ratio = 1)
+
+})
+
+patchwork::wrap_plots(plt, nrow = 3, ncol = 5, guides = "collect") & theme(legend.position = 'bottom')
+```
+
+Plot expression of 15 most significant genes (cells coloured by celltype):
+
+```{r fig.width = 14, fig.height = 9}
+ids <- head(rownames(res), n = 15)
+
+plt <- lapply(ids, function(gene) {
+  
+  dat$expression <- assay(sce, "reconstructed")[gene, dat$cell]
+  
+  ggplot(dat, aes(pseudotime, expression, group = lineage, colour = celltype)) + 
+    geom_point() + 
+    scale_colour_manual(values = EmbryoCelltypeColours) + 
+    geom_smooth(colour = "black", method = "loess") + 
+    labs(title = gene, x = "Pseudotime", y = "Expression", colour = "Celltype") + 
+    theme_bw() + 
+    theme(aspect.ratio = 1)
+
+})
+
+patchwork::wrap_plots(plt, nrow = 3, ncol = 5, guides = "collect") & theme(legend.position = 'bottom')
+```
+
+Plot expression of 15 most significant genes (cells coloured by cluster):
+
+```{r fig.width = 14, fig.height = 9}
+ids <- head(rownames(res), n = 15)
+
+plt <- lapply(ids, function(gene) {
+  
+  dat$expression <- assay(sce, "reconstructed")[gene, dat$cell]
+  
+  ggplot(dat, aes(pseudotime, expression, group = lineage, colour = cluster)) + 
+    geom_point() + 
+    scale_colour_manual(values = EmbryoClusterColours) + 
+    geom_smooth(colour = "black", method = "loess") + 
+    labs(title = gene, x = "Pseudotime", y = "Expression", colour = "Cluster") + 
+    theme_bw() + 
+    theme(aspect.ratio = 1)
+
+})
+
+patchwork::wrap_plots(plt, nrow = 3, ncol = 5, guides = "collect") & theme(legend.position = 'bottom')
+```
+
+Plot expression of 15 most significant genes (cells coloured by source):
+
+```{r fig.width = 14, fig.height = 9}
+ids <- head(rownames(res), n = 15)
+
+plt <- lapply(ids, function(gene) {
+  
+  dat$expression <- assay(sce, "reconstructed")[gene, dat$cell]
+  
+  ggplot(dat, aes(pseudotime, expression, group = lineage, colour = source)) + 
+    geom_point() + 
+    scale_colour_manual(values = EmbryoSourceColours, labels = EmbryoSourceLabels) + 
+    geom_smooth(colour = "black", method = "loess") + 
+    labs(title = gene, x = "Pseudotime", y = "Expression", colour = "Source") + 
+    theme_bw() + 
+    theme(aspect.ratio = 1)
+
+})
+
+patchwork::wrap_plots(plt, nrow = 3, ncol = 5, guides = "collect") & theme(legend.position = 'bottom')
+```
+
+### earlyDETest
+
+Visualise the placement of the knots generated by the linear model:
+
+```{r}
+plotGeneCount(curve = sds, clusters = sce$cluster, models = fit)
+```
+
+Test differences in expression around the seperation of lineages:
+
+```{r}
+res <- earlyDETest(fit, knots = c(1, 3))
+
+res <- subset(res, p.adjust(pvalue, method = "fdr") < 0.05)
+
+res <- res[order(res$waldStat, decreasing = TRUE), ]
+
+DT::datatable(as.data.frame(res))
+```
+
+Save results table of significant genes for downstream analysis:
+
+```{r}
+metadata(sce)$earlyDETest <- res
+```
+
+Plot expression of 15 most significant genes (cells coloured by lineage):
+
+```{r fig.width = 14, fig.height = 9}
+ids <- head(rownames(res), n = 15)
+
+plt <- lapply(ids, function(gene) {
+  
+  dat$expression <- assay(sce, "reconstructed")[gene, dat$cell]
+  
+  ggplot(dat, aes(pseudotime, expression, group = lineage, colour = lineage)) + 
+    geom_point() + 
+    scale_colour_brewer(palette = "Set1") + 
+    geom_smooth(colour = "black", method = "loess") + 
+    labs(title = gene, x = "Pseudotime", y = "Expression", colour = "Lineage") + 
+    theme_bw() + 
+    theme(aspect.ratio = 1)
+
+})
+
+patchwork::wrap_plots(plt, nrow = 3, ncol = 5, guides = "collect") & theme(legend.position = 'bottom')
+```
+
+Plot expression of 15 most significant genes (cells coloured by genotype):
+
+```{r fig.width = 14, fig.height = 9}
+ids <- head(rownames(res), n = 15)
+
+plt <- lapply(ids, function(gene) {
+  
+  dat$expression <- assay(sce, "reconstructed")[gene, dat$cell]
+  
+  ggplot(dat, aes(pseudotime, expression, group = lineage, colour = genotype)) + 
+    geom_point() + 
+    scale_colour_manual(values = EmbryoGenotypeColours, labels = EmbryoGenotypeLabels) + 
+    geom_smooth(colour = "black", method = "loess") + 
+    labs(title = gene, x = "Pseudotime", y = "Expression", colour = "Genotype") + 
+    theme_bw() + 
+    theme(aspect.ratio = 1)
+
+})
+
+patchwork::wrap_plots(plt, nrow = 3, ncol = 5, guides = "collect") & theme(legend.position = 'bottom')
+```
+
+Plot expression of 15 most significant genes (cells coloured by celltype):
+
+```{r fig.width = 14, fig.height = 9}
+ids <- head(rownames(res), n = 15)
+
+plt <- lapply(ids, function(gene) {
+  
+  dat$expression <- assay(sce, "reconstructed")[gene, dat$cell]
+  
+  ggplot(dat, aes(pseudotime, expression, group = lineage, colour = celltype)) + 
+    geom_point() + 
+    scale_colour_manual(values = EmbryoCelltypeColours) + 
+    geom_smooth(colour = "black", method = "loess") + 
+    labs(title = gene, x = "Pseudotime", y = "Expression", colour = "Celltype") + 
+    theme_bw() + 
+    theme(aspect.ratio = 1)
+
+})
+
+patchwork::wrap_plots(plt, nrow = 3, ncol = 5, guides = "collect") & theme(legend.position = 'bottom')
+```
+
+Plot expression of 15 most significant genes (cells coloured by cluster):
+
+```{r fig.width = 14, fig.height = 9}
+ids <- head(rownames(res), n = 15)
+
+plt <- lapply(ids, function(gene) {
+  
+  dat$expression <- assay(sce, "reconstructed")[gene, dat$cell]
+  
+  ggplot(dat, aes(pseudotime, expression, group = lineage, colour = cluster)) + 
+    geom_point() + 
+    scale_colour_manual(values = EmbryoClusterColours) + 
+    geom_smooth(colour = "black", method = "loess") + 
+    labs(title = gene, x = "Pseudotime", y = "Expression", colour = "Cluster") + 
+    theme_bw() + 
+    theme(aspect.ratio = 1)
+
+})
+
+patchwork::wrap_plots(plt, nrow = 3, ncol = 5, guides = "collect") & theme(legend.position = 'bottom')
+```
+
+Plot expression of 15 most significant genes (cells coloured by source):
+
+```{r fig.width = 14, fig.height = 9}
+ids <- head(rownames(res), n = 15)
+
+plt <- lapply(ids, function(gene) {
+  
+  dat$expression <- assay(sce, "reconstructed")[gene, dat$cell]
+  
+  ggplot(dat, aes(pseudotime, expression, group = lineage, colour = source)) + 
+    geom_point() + 
+    scale_colour_manual(values = EmbryoSourceColours, labels = EmbryoSourceLabels) + 
+    geom_smooth(colour = "black", method = "loess") + 
+    labs(title = gene, x = "Pseudotime", y = "Expression", colour = "Source") + 
+    theme_bw() + 
+    theme(aspect.ratio = 1)
+
+})
+
+patchwork::wrap_plots(plt, nrow = 3, ncol = 5, guides = "collect") & theme(legend.position = 'bottom')
+```
+
+## Summary
+
+Save experiment object with tradeSeq results:
+
+```{r}
+saveRDS(sce, file = "data/04-differential-analysis.rds")
+```
+
+Print session information:
+
+```{r}
+sessionInfo()
+```

@@ -1,0 +1,155 @@
+---
+title: "Cell fate analysis"
+author: "James Ashmore"
+date: "2020-04-22"
+output: workflowr::wflow_html
+editor_options:
+  chunk_output_type: console
+---
+
+## Setup
+
+Set chunk options:
+
+```{r}
+knitr::opts_chunk$set(
+  autodep    = TRUE,
+  cache      = TRUE,
+  cache.path = "cache/06-cell-fate.Rmd/",
+  dev        = "png",
+  error      = FALSE,
+  message    = FALSE,
+  warning    = FALSE
+)
+```
+
+Load required R packages:
+
+```{r}
+pkg <- c("reticulate", "ggplot2", "SingleCellExperiment", "scater")
+
+lib <- lapply(pkg, library, character.only = TRUE)
+```
+
+Import experiment data:
+
+```{r}
+sce <- readRDS("data/04-differential-analysis.rds")
+```
+
+Create rudimentary experiment object:
+
+```{r}
+obj <- list(
+  assays = list(
+    reconstructed = as.data.frame(assay(sce, "reconstructed"))
+  ),
+  colData = as.data.frame(colData(sce)),
+  rowData = as.data.frame(rowData(sce)[, c("gene_id", "gene_name")]),
+  reducedDims = list(
+    pca = as.data.frame(reducedDim(sce, "corrected")),
+    umap = as.data.frame(reducedDim(sce, "UMAP")),
+    diff = as.data.frame(reducedDim(sce, "DiffusionMap"))
+  )
+)
+```
+
+Import required Python packages:
+
+```{python}
+import scanpy.external as sce
+import scanpy as sc
+
+import pandas as pd
+import matplotlib.pyplot as plt
+
+import palantir
+```
+
+Create AnnData object from experiment object:
+
+```{python}
+ann = sc.AnnData(X = r.obj['assays']['reconstructed'].T, obs = r.obj['colData'], var = r.obj['rowData'])
+
+ann.obsm['pca'] = r.obj['reducedDims']['pca']
+
+ann.obsm['umap'] = r.obj['reducedDims']['umap']
+
+ann.obsm['diff'] = r.obj['reducedDims']['diff']
+```
+
+
+```{python}
+normalize_counts = pd.DataFrame(ann.X, index = ann.obs.index, columns = ann.var.index)
+```
+
+```{python}
+pca_projections, _ = palantir.utils.run_pca(normalize_counts, n_components = 50)
+```
+
+```{python}
+diffusion_map = palantir.utils.run_diffusion_maps(pca_projections)
+```
+
+```{python}
+multiscale_space = palantir.utils.determine_multiscale_space(diffusion_map)
+```
+
+```{python}
+tsne = palantir.utils.run_tsne(multiscale_space, perplexity = 30, n_iter = 1000, random_state = 42)
+```
+
+```{python}
+fig, ax = palantir.plot.plot_tsne(tsne)
+plt.show()
+```
+
+```{python}
+magic_imputation = palantir.utils.run_magic_imputation(normalize_counts, diffusion_map)
+```
+
+```{python}
+fig = palantir.plot.plot_gene_expression(magic_imputation, tsne, ['Etv2', 'Kdr'])
+plt.show()
+```
+
+```{python}
+fig = palantir.plot.plot_diffusion_components(tsne, diffusion_map)
+plt.show()
+```
+
+```{python}
+fig = palantir.plot.plot_cell_clusters(tsne, ann.obs['cluster'])
+plt.show()
+```
+
+```{python}
+fig = palantir.plot.plot_cell_clusters(tsne, ann.obs['celltype'])
+plt.show()
+```
+
+```{python}
+palantir.plot.plot_cell_clusters(tsne, ann.obs['source'])
+plt.show()
+```
+
+```{python}
+palantir.plot.plot_cell_clusters(tsne, ann.obs['genotype'])
+plt.show()
+```
+
+```{python}
+fig = palantir.plot.highlight_cells_on_tsne(tsne, 'allantois-kdr-54')
+plt.show()
+```
+
+```{python}
+palantir_result = palantir.core.run_palantir(multiscale_space, 'allantois-kdr-54', num_waypoints = 500)
+```
+
+Visualize palantir results:
+
+```{python}
+fig = palantir.plot.plot_palantir_results(palantir_result, tsne)
+plt.show()
+```

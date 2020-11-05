@@ -1,0 +1,440 @@
+---
+title: "Atlas integration"
+author: "James Ashmore"
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+output: workflowr::wflow_html
+editor_options:
+  chunk_output_type: console
+---
+
+## Setup
+
+Set chunk options:
+
+```{r knitr}
+knitr::opts_chunk$set(
+  autodep    = TRUE,
+  cache      = TRUE,
+  cache.path = "cache/02-atlas-integration.Rmd/",
+  cache.lazy = FALSE,
+  dev        = "png",
+  error      = FALSE,
+  message    = FALSE,
+  warning    = FALSE
+)
+```
+
+Load required packages:
+
+```{r}
+pkg <- c("scater", "scran", "uwot", "Rtsne", "batchelor", "EnsDb.Mmusculus.v79", "org.Mm.eg.db", "msigdbr")
+
+lib <- lapply(pkg, library, character.only = TRUE)
+```
+
+## Data
+
+### Allantois
+
+Read processed experiment data:
+
+```{r}
+sce1 <- readRDS("data/allantois-wt.rds")
+
+sce2 <- readRDS("data/allantois-kdr.rds")
+```
+
+Extract original experiment data:
+
+```{r}
+alt1 <- altExp(sce1, "original", withColData = TRUE)
+
+alt2 <- altExp(sce2, "original", withColData = TRUE)
+```
+
+Make cell names unique across experiments:
+
+```{r}
+colnames(alt1) <- paste0("allantois-wt-", seq_len(ncol(alt1)))
+
+colnames(alt2) <- paste0("allantois-kdr-", seq_len(ncol(alt2)))
+```
+
+Make feature names compatible across experiments:
+
+```{r}
+rownames(alt1) <- rowData(alt1)$gene_id
+
+rownames(alt2) <- rowData(alt2)$gene_id
+```
+
+Make altExp compatible across experiments:
+
+```{r}
+altExp(alt1, "ERCC") <- NULL
+
+altExp(alt2, "ERCC") <- NULL
+```
+
+### Atlas
+
+Load the MouseGastrulationData package:
+
+```{r}
+library(MouseGastrulationData)
+```
+
+Select E8.25 samples:
+
+```{r}
+AtlasSampleMetadata <- subset(AtlasSampleMetadata, stage == "E8.25")
+```
+
+Obtain processed samples from the dataset:
+
+```{r}
+ref <- EmbryoAtlasData(type = "processed", samples = AtlasSampleMetadata$sample)
+```
+
+Filter cells that are labelled as stripped nuclei:
+
+```{r}
+ref <- ref[, !ref$stripped]
+```
+
+Filter cells that are labelled as doublets:
+
+```{r}
+ref <- ref[, !ref$doublet]
+```
+
+Filter cells with no celltype label:
+
+```{r}
+ref <- ref[, !is.na(ref$celltype)]
+```
+
+Compute log-transformed normalized expression values:
+
+```{r}
+ref <- logNormCounts(ref)
+```
+
+Make cell names unique across experiments:
+
+```{r}
+colnames(ref) <- paste0("atlas-", seq_len(ncol(ref)))
+```
+
+Make feature names compatible across experiments:
+
+```{r}
+rownames(ref) <- rowData(ref)$ENSEMBL
+```
+
+Make dimension names compatible across experiments:
+
+```{r}
+reducedDimNames(ref) <- c("PCA", "UMAP")
+```
+
+## Integration
+
+### Variance modelling
+
+Collect variance modelling statistics:
+
+```{r}
+dec.ref <- modelGeneVar(ref, block = ref$sample)
+
+dec.alt1 <- metadata(alt1)$modelGeneVarWithSpikes
+
+dec.alt2 <- metadata(alt2)$modelGeneVarWithSpikes
+```
+
+Make features names compatible across experiments:
+
+```{r}
+rownames(dec.ref) <- rowData(ref)$ENSEMBL
+
+rownames(dec.alt1) <- rowData(alt1)$gene_id
+
+rownames(dec.alt2) <- rowData(alt2)$gene_id
+```
+
+Identify common feature names across experiments:
+
+```{r}
+ids.ref <- rownames(dec.ref)
+
+ids.alt1 <- rownames(dec.alt1)
+
+ids.alt2 <- rownames(dec.alt2)
+
+ids.all <- Reduce(intersect, list(ids.ref, ids.alt1, ids.alt2))
+```
+
+Combine variance modelling results from both studies:
+
+```{r}
+dec.ref <- dec.ref[ids.all, ]
+
+dec.alt1 <- dec.alt1[ids.all, ]
+
+dec.alt2 <- dec.alt2[ids.all, ]
+
+dec.all <- combineVar(dec.ref, dec.alt1, dec.alt2)
+```
+
+### Feature selection
+
+Filter Xist gene from list of features:
+
+```{r}
+ids <- rownames(dec.all)
+
+lgl <- ids == "ENSMUSG00000086503" # Xist
+
+ids <- ids[!lgl]
+```
+
+Filter Y chromosome genes from list of features:
+
+```{r}
+ens <- keys(EnsDb.Mmusculus.v79, keytype = "GENEID", filter = SeqNameFilter("Y"))
+
+lgl <- ids %in% ens
+
+ids <- ids[!lgl]
+```
+
+Filter MT chromosome genes from list of features:
+
+```{r}
+ens <- keys(EnsDb.Mmusculus.v79, keytype = "GENEID", filter = SeqNameFilter("MT"))
+
+lgl <- ids %in% ens
+
+ids <- ids[!lgl]
+```
+
+Filter cell-cycle genes from list of features:
+
+```{r}
+org <- select(org.Mm.eg.db, keys = "GO:0007049", keytype = "GOALL", column = "ENSEMBL")
+
+lgl <- ids %in% org$ENSEMBL
+
+ids <- ids[!lgl]
+```
+
+Filter ribosomal genes from list of features:
+
+```{r}
+sig <- msigdbr(species = "Mus musculus", category = "C2")
+
+sig <- subset(sig, gs_name == "KEGG_RIBOSOME")
+
+org <- select(org.Mm.eg.db, keys = sig$gene_symbol, keytype = "SYMBOL", column = "ENSEMBL")
+
+lgl <- ids %in% org$ENSEMBL
+
+ids <- ids[!lgl]
+```
+
+Select highly variable genes:
+
+```{r}
+hvg <- getTopHVGs(dec.all[ids, ], var.threshold = 0)
+```
+
+### Batch normalization
+
+Identify common feature names across experiments:
+
+```{r}
+ids.ref <- rownames(ref)
+
+ids.alt1 <- rownames(alt1)
+
+ids.alt2 <- rownames(alt2)
+
+ids.all <- Reduce(intersect, list(ids.ref, ids.alt1, ids.alt2))
+```
+
+Subset experiments to common universe of features:
+
+```{r}
+ref <- ref[ids.all, ]
+
+alt1 <- alt1[ids.all, ]
+
+alt2 <- alt2[ids.all, ]
+```
+
+Define source label before splitting experiments:
+
+```{r}
+ref$source <- "atlas"
+
+alt1$source <- "allantois"
+
+alt2$source <- "allantois"
+```
+
+Define batch label before splitting experiments:
+
+```{r}
+ref$batch <- paste0("atlas-", ref$sample)
+
+alt1$batch <- "allantois-wt"
+
+alt2$batch <- "allantois-kdr"
+```
+
+Define genotype label before splitting experiments:
+
+```{r}
+ref$genotype <- "wt"
+
+alt1$genotype <- "wt"
+
+alt2$genotype <- "kdr"
+```
+
+Define cluster label before splitting experiments:
+
+```{r}
+ref$cluster <- paste0("atlas-", ref$cluster)
+
+alt1$cluster <- paste0("allantois-wt-", alt1$cluster)
+
+alt2$cluster <- paste0("allantois-kdr-", alt2$cluster)
+```
+
+Split experiments by batch into a list:
+
+```{r}
+fct <- unique(ref$sample)
+
+all <- lapply(fct, function(x) ref[, ref$sample == x])
+
+all <- c(all, alt1, alt2)
+
+lvl <- paste0("atlas-", fct)
+
+names(all) <- c(lvl, "allantois-wt", "allantois-kdr")
+```
+
+Perform batch normalization:
+
+```{r}
+all <- do.call(multiBatchNorm, all)
+```
+
+### Batch integration
+
+Clear incompatible data from all experiments before merging:
+
+```{r}
+itr <- seq_along(all)
+
+for (i in itr) {
+  
+  rowData(all[[i]]) <- NULL
+  
+  colData(all[[i]]) <- colData(all[[i]])[, c("batch", "cluster", "celltype", "genotype", "source")]
+  
+  metadata(all[[i]]) <- list()
+  
+  reducedDims(all[[i]]) <- list()
+
+}
+```
+
+Create combined experiment object for integration:
+
+```{r}
+all <- do.call(cbind, all)
+```
+
+Create merge order for experiments:
+
+```{r}
+idx <- list("atlas-25", "atlas-24", "atlas-28", "allantois-wt", "allantois-kdr")
+```
+
+Correct experiments in order specified above:
+
+```{r}
+set.seed(1110110110)
+
+mnn <- correctExperiments(
+  all,
+  batch = all$batch,
+  subset.row = hvg,
+  correct.all = TRUE,
+  PARAM = FastMnnParam(merge.order = idx)
+)
+```
+
+Inspect the percentage of variance lost as a diagnostic:
+
+```{r}
+metadata(mnn)$merge.info$lost.var
+```
+
+## Exploration
+
+Create UMAP matrix using settings from MouseGastrulationData analysis:
+
+```{r}
+set.seed(42)
+
+mnn <- runUMAP(mnn, dimred = "corrected", n_neighbors = 20, min_dist = 0.7, approx_pow = TRUE)
+```
+
+Create UMAP plot coloured by celltype and facetted by batch:
+
+```{r fig.width = 12, fig.height = 9}
+dim <- reducedDim(mnn, "UMAP")
+
+colnames(dim) <- c("X", "Y")
+
+dat <- as.data.frame(mnn@colData)
+
+tbl <- cbind(dim, dat)
+
+tbl$batch <- factor(tbl$batch, levels = c("atlas-25", "atlas-24", "atlas-28", "allantois-wt", "allantois-kdr"))
+
+ggplot(tbl, aes(X, Y, colour = celltype)) + 
+  geom_point(data = tbl[, c("X", "Y")], colour = "#F0F0F0") + 
+  geom_point(size = 0.5) + 
+  scale_colour_manual(values = MouseGastrulationData::EmbryoCelltypeColours) + 
+  guides(colour = guide_legend(override.aes = list(size = 1.5))) + 
+  facet_wrap(~ batch) + 
+  theme_void() + 
+  theme(
+    aspect.ratio = 1,
+    legend.position = "bottom",
+    legend.title = element_blank()
+  )
+```
+
+## Summary
+
+### Ouptut
+
+Save integrated experiment object to disk:
+
+```{r}
+saveRDS(mnn, file = "data/02-atlas-integration.rds")
+```
+
+### Session
+
+Print session information:
+
+```{r}
+sessionInfo()
+```

@@ -1,0 +1,375 @@
+---
+title: "Correcting allantois experiments"
+author: "James Ashmore"
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+output: workflowr::wflow_html
+editor_options:
+  chunk_output_type: console
+---
+
+## Setup
+
+Set chunk options:
+
+```{r knitr}
+knitr::opts_chunk$set(
+  autodep    = TRUE,
+  cache      = TRUE,
+  cache.path = "cache/01-allantois-correction.Rmd/",
+  cache.lazy = FALSE,
+  dev        = "png",
+  error      = FALSE,
+  message    = FALSE,
+  warning    = FALSE
+)
+```
+
+Load required packages:
+
+```{r}
+pkg <- c("BiocParallel", "SingleCellExperiment", "scater", "scran", "uwot", "Rtsne", "batchelor", "patchwork", "EnsDb.Mmusculus.v79", "org.Mm.eg.db", "msigdbr")
+
+lib <- lapply(pkg, library, character.only = TRUE)
+```
+
+## Data
+
+### Allantois
+
+Read processed experiment data:
+
+```{r}
+sce1 <- readRDS("data/allantois-wt.rds")
+
+sce2 <- readRDS("data/allantois-kdr.rds")
+```
+
+Extract original experiment data:
+
+```{r}
+alt1 <- altExp(sce1, "original", withColData = TRUE)
+
+alt2 <- altExp(sce2, "original", withColData = TRUE)
+```
+
+Make cell names unique across experiments:
+
+```{r}
+colnames(alt1) <- paste0("allantois-wt-", seq_len(ncol(alt1)))
+
+colnames(alt2) <- paste0("allantois-kdr-", seq_len(ncol(alt2)))
+```
+
+Make feature names compatible across experiments:
+
+```{r}
+rownames(alt1) <- rowData(alt1)$gene_id
+
+rownames(alt2) <- rowData(alt2)$gene_id
+```
+
+Make altExp compatible across experiments:
+
+```{r}
+altExp(alt1, "ERCC") <- NULL
+
+altExp(alt2, "ERCC") <- NULL
+```
+
+## Integration
+
+### Variance modelling
+
+Collect variance modelling statistics:
+
+```{r}
+dec1 <- metadata(alt1)$modelGeneVarWithSpikes
+
+dec2 <- metadata(alt2)$modelGeneVarWithSpikes
+```
+
+Make features names compatible across experiments:
+
+```{r}
+rownames(dec1) <- rowData(alt1)$gene_id
+
+rownames(dec2) <- rowData(alt2)$gene_id
+```
+
+Identify common feature names across experiments:
+
+```{r}
+ids1 <- rownames(dec1)
+
+ids2 <- rownames(dec2)
+
+ids <- intersect(ids1, ids2)
+```
+
+Combine variance modelling results from both studies:
+
+```{r}
+dec1 <- dec1[ids, ]
+
+dec2 <- dec2[ids, ]
+
+dec <- combineVar(dec1, dec2)
+
+rownames(dec) <- ids
+```
+
+### Feature selection
+
+Filter Xist gene from list of features:
+
+```{r}
+hvg <- rownames(dec)
+
+lgl <- hvg == "ENSMUSG00000086503" # Xist
+
+hvg <- hvg[!lgl]
+```
+
+Filter Y chromosome genes from list of features:
+
+```{r}
+ids <- keys(EnsDb.Mmusculus.v79, keytype = "GENEID", filter = SeqNameFilter("Y"))
+
+lgl <- hvg %in% ids
+
+hvg <- hvg[!lgl]
+```
+
+Filter MT chromosome genes from list of features:
+
+```{r}
+ids <- keys(EnsDb.Mmusculus.v79, keytype = "GENEID", filter = SeqNameFilter("MT"))
+
+lgl <- hvg %in% ids
+
+hvg <- hvg[!lgl]
+```
+
+Filter cell-cycle genes from list of features:
+
+```{r}
+org <- select(org.Mm.eg.db, keys = "GO:0007049", keytype = "GOALL", column = "ENSEMBL")
+
+lgl <- hvg %in% org$ENSEMBL
+
+hvg <- hvg[!lgl]
+```
+
+Filter ribosomal genes from list of features:
+
+```{r}
+ids <- select(EnsDb.Mmusculus.v79, keys = keys(EnsDb.Mmusculus.v79), columns = c("GENEID", "GENENAME"), keytype = "GENEID")
+
+sig <- msigdbr(species = "Mus musculus", category = "C2")
+
+sig <- subset(sig, gs_name == "KEGG_RIBOSOME")
+
+org <- select(org.Mm.eg.db, keys = sig$gene_symbol, keytype = "SYMBOL", column = "ENSEMBL")
+
+lgl <- hvg %in% org$ENSEMBL
+
+hvg <- hvg[!lgl]
+```
+
+Select features for batchelor integration:
+
+```{r eval = FALSE}
+hvg <- getTopHVGs(dec[hvg, ], prop = 0.1)
+```
+
+Define a set of markers to use for correction:
+  
+```{r eval = TRUE}
+res1 <- pairwiseWilcox(logcounts(alt1), alt1$cluster, direction = "up")
+
+sig1 <- getTopMarkers(res1$statistics, res1$pairs, n = 10)
+
+res2 <- pairwiseWilcox(logcounts(alt2), alt2$cluster, direction = "up")
+
+sig2 <- getTopMarkers(res2$statistics, res2$pairs, n = 10)
+
+ids <- unique(unlist(c(unlist(sig1), unlist(sig2))))
+
+hvg <- ids[ids %in% hvg]
+```
+
+### Batch normalization
+
+Identify common feature names across experiments:
+
+```{r}
+ids1 <- rownames(alt1)
+
+ids2 <- rownames(alt2)
+
+ids <- intersect(ids1, ids2)
+```
+
+Subset experiments to common universe of features:
+
+```{r}
+alt1 <- alt1[ids, ]
+
+alt2 <- alt2[ids, ]
+```
+
+Per-batch scaling normalization:
+
+```{r}
+out <- multiBatchNorm("allantois-wt" = alt1, "allantois-kdr" = alt2, norm.args = list(use_altexps = FALSE))
+
+alt1 <- out[["allantois-wt"]]
+
+alt2 <- out[["allantois-kdr"]]
+```
+
+### Batch combination
+
+Combine experiments with no correction:
+
+```{r}
+all <- correctExperiments("allantois-wt" = alt1, "allantois-kdr" = alt2, PARAM = NoCorrectParam())
+```
+
+Calculate PCA reduced dimensions:
+
+```{r}
+set.seed(1101011110)
+
+all <- runPCA(all, subset_row = hvg)
+```
+
+Create PCA plot coloured by batch:
+
+```{r}
+plotPCA(all, colour_by = "batch")
+```
+
+Create PCA plot coloured by celltype:
+
+```{r}
+plotPCA(all, colour_by = "celltype")
+```
+
+Calculate UMAP reduced dimensions:
+
+```{r}
+set.seed(1101011110)
+
+all <- runUMAP(all, dimred = "PCA")
+```
+
+Create UMAP plot coloured by batch:
+
+```{r}
+plotUMAP(all, colour_by = "batch")
+```
+
+Create UMAP plot coloured by celltype:
+
+```{r}
+plotUMAP(all, colour_by = "celltype")
+```
+
+### Batch Correction
+
+Perform fast mutual nearest neighbors correction:
+
+```{r}
+set.seed(1010111011)
+
+mnn <- correctExperiments(all, batch = all$batch, subset.row = hvg, correct.all = TRUE)
+```
+
+Check proportion of lost variance to ensure genuine biological heterogeneity is not being removed:
+
+```{r}
+metadata(mnn)$merge.info$lost.var
+```
+
+## Exploration
+
+### MNN embedding
+
+Create MNN plot coloured by batch:
+
+```{r}
+plotReducedDim(mnn, "corrected", colour_by = "batch")
+```
+
+Create MNN plot coloured by celltype:
+
+```{r}
+plotReducedDim(mnn, "corrected", colour_by = "celltype")
+```
+
+### UMAP embedding
+
+Calculate UMAP using different parameters:
+
+```{r eval = FALSE}
+num <- c(5, 15, 30, 50, 100)
+
+dst <- c(0, 0.01, 0.05, 0.1, 0.5, 1)
+
+arg <- expand.grid(n_neighbors = num, min_dist = dst)
+
+funUMAP <- function(x, dimred, n_neighbors, min_dist) {
+  
+  set.seed(1011101101)
+  
+  runUMAP(x, dimred = dimred, n_neighbors = n_neighbors, min_dist = min_dist)
+
+}
+
+run <- mapply(
+  FUN = funUMAP,
+  n_neighbors = arg$n_neighbors,
+  min_dist = arg$min_dist,
+  MoreArgs = list(x = mnn, dimred = "corrected"),
+  SIMPLIFY = FALSE
+)
+```
+
+Select optimal UMAP parameters:
+
+```{r}
+set.seed(1011101101)
+
+mnn <- runUMAP(mnn, dimred = "corrected", n_neighbors = 30, min_dist = 0.5)
+```
+
+Create UMAP plot coloured by batch:
+
+```{r}
+plotUMAP(mnn, colour_by = "batch")
+```
+
+Create UMAP plot coloured by celltype:
+
+```{r}
+plotUMAP(mnn, colour_by = "celltype")
+```
+
+## Summary
+
+### Output
+
+Write experiment object to a file:
+
+```{r}
+saveRDS(mnn, file = "data/01-allantois-correction.rds")
+```
+
+### Session
+
+Print version information about R, the OS and attached or loaded packages:
+
+```{r}
+sessionInfo()
+```

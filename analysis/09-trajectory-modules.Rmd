@@ -1,0 +1,386 @@
+---
+title: "Trajectory modules"
+author: "James Ashmore"
+date: "2020-04-22"
+output: workflowr::wflow_html
+editor_options:
+  chunk_output_type: console
+---
+
+## Setup
+
+Set chunk options:
+
+```{r}
+knitr::opts_chunk$set(
+  autodep    = TRUE,
+  cache      = TRUE,
+  cache.path = "cache/09-trajectory-modules.Rmd/",
+  dev        = "png",
+  error      = FALSE,
+  message    = FALSE,
+  warning    = FALSE
+)
+```
+
+Load Bioconductor packages:
+
+```{r}
+library(limma)
+library(org.Mm.eg.db)
+library(scater)
+library(scran)
+```
+
+Load CRAN packages:
+
+```{r}
+library(ggplot2)
+library(reshape2)
+```
+
+Read experiment data:
+
+```{r}
+sce <- readRDS("data/04-differential-analysis.rds")
+```
+
+## Utils
+
+Define function to rescale the expression data:
+
+```{r}
+rescale <- function(x) {
+  
+  x <- as.matrix(x)
+	
+  nsamples <- ncol(x)
+  
+  M <- rowMeans(x, na.rm = TRUE)
+	
+  DF <- nsamples - 1L
+	
+  isNA <- is.na(x)
+	
+  if (any(isNA)) {
+    
+    mode(isNA) <- "integer"
+		
+    DF <-  DF - rowSums(isNA)
+		
+    DF[DF == 0L] <- 1L
+	
+  }
+	
+  x <- x - M
+	
+  V <- rowSums(x^2L, na.rm = TRUE) / DF
+	
+  x <- x / sqrt(V + 0.01)
+
+}
+```
+
+Define function to reorder experiment data:
+
+```{r}
+reorder <- function(x, subset, select) {
+  
+  row <- subset %in% rownames(x)
+  
+  col <- order(select)
+  
+  x[row, col]
+
+}
+```
+
+Define wrapper for the goana function:
+
+```{r}
+calculateGO <- function(query, subject) {
+  
+  res <- goana(de = query, universe = subject, species = "Mm")
+  
+  res <- split(res, res$Ont)
+  
+  res <- lapply(res, function(x) x[order(x$P.DE, decreasing = FALSE), ])
+  
+  res <- lapply(res, function(x) { x$FDR <- p.adjust(x$P.DE, method = "fdr"); x} )
+  
+  res <- lapply(res, subset, FDR < 0.05)
+  
+  return(res)
+
+}
+```
+
+Define function to visualise GO results:
+
+```{r}
+visualiseGO <- function(results, n = 10) {
+  
+  results <- head(results, n = n)
+  
+  if (nrow(results) == 0) { return(ggplot() + theme_void()) }
+  
+  results$Term <- tools::toTitleCase(results$Term)
+  
+  results$Ratio <- results$DE / results$N
+
+  plt <- ggplot(results, aes(x = Ratio, y = stats::reorder(Term, Ratio), colour = -log10(FDR), size = DE)) + 
+    geom_point() + 
+    scale_colour_viridis_c() + 
+    labs(x = "Ratio", size = "Count", colour = "-log10(FDR)") + 
+    guides(colour = guide_colorbar(order = 1), size = guide_legend(order = 2)) +
+    theme_bw() + 
+    theme(axis.title.y = element_blank())
+  
+  return(plt)
+
+}
+```
+
+Define wrapper for the kegga function:
+
+```{r}
+calculateKEGG <- function(query, subject) {
+  
+  res <- kegga(de = query, universe = subject, species = "Mm")
+
+  res <- res[order(res$P.DE, decreasing = FALSE), ]
+
+  res$FDR <- p.adjust(res$P.DE, method = "fdr")
+  
+  res <- sig <- subset(res, FDR < 0.05)
+  
+  return(res)
+
+}
+```
+
+Define function to visualise KEGG results:
+
+```{r}
+visualiseKEGG <- function(results, n = 10) {
+  
+  results <- head(results, n = n)
+  
+  if (nrow(results) == 0) { return(ggplot() + theme_void()) }
+  
+  results$Pathway <- tools::toTitleCase(results$Pathway)
+  
+  results$Ratio <- results$DE / results$N
+
+  plt <- ggplot(results, aes(x = Ratio, y = stats::reorder(Pathway, Ratio), colour = -log10(FDR), size = DE)) + 
+    geom_point() + 
+    scale_colour_viridis_c() + 
+    labs(x = "Ratio", size = "Count", colour = "-log10(FDR)") + 
+    guides(colour = guide_colorbar(order = 1), size = guide_legend(order = 2)) +
+    theme_bw() + 
+    theme(axis.title.y = element_blank())
+  
+  return(plt)
+
+}
+```
+
+## Modules
+
+Rescale the expression data prior to clustering:
+
+```{r}
+assay(sce, "rescaled") <- rescale(assay(sce, "reconstructed"))
+```
+
+Define a set of background universe genes:
+
+```{r}
+dec <- modelGeneVar(sce, block = sce$batch)
+
+hvg <- getTopHVGs(dec, var.threshold = 0) # take all genes with biological variation
+
+ens <- rowData(sce)$gene_id[match(hvg, rownames(sce))]
+
+uni <- mapIds(org.Mm.eg.db, keys = ens, column = "ENTREZID", keytype = "ENSEMBL")
+```
+
+### Lineage 1
+
+#### Clustering
+
+Extract association test results from experiment metadata:
+
+```{r}
+res <- metadata(sce)$associationTest
+```
+
+Create data frame of association test results for slingPseudotime_1 lineage:
+
+```{r}
+sp1 <- data.frame(
+  waldStat = res$slingPseudotime_1$waldStat_1, 
+  df = res$slingPseudotime_1$df_1, 
+  pvalue = res$slingPseudotime_1$pvalue_1, 
+  fdr = p.adjust(res$slingPseudotime_1$pvalue_1, method = "fdr"),
+  row.names = rownames(res$slingPseudotime_1)
+)
+```
+
+Reorder experiment data by slingPseudotime_1 lineage:
+
+```{r}
+sc1 <- reorder(sce, subset = rownames(sp1), select = sce$slingPseudotime_1)
+
+use <- !is.na(sc1$slingPseudotime_1)
+
+sc1 <- sc1[, use]
+```
+
+Cluster expression patterns of significant genes in slingPseudotime_1 lineage:
+
+```{r}
+set.seed(515499208)
+
+km1 <- kmeans(x = assay(sc1, "rescaled"), centers = 3)
+
+sp1$cluster <- km1$cluster[rownames(sp1)]
+```
+
+Plot clustered expression patterns to see how they behave across the slingPseudotime_1 lineage:
+
+```{r}
+clust.centroid <- function(i, assay, cluster) {
+  ind <- (cluster == i)
+  colMeans(assay[ind, ])
+}
+
+lvl <- unique(km1$cluster)
+
+df1 <- sapply(lvl, clust.centroid, assay(sc1, "rescaled"), km1$cluster)
+
+df1 <- melt(df1)
+
+colnames(df1) <- c("cell", "cluster", "exprs")
+
+df1$pseudotime <- sc1$slingPseudotime_1[df1$cell]
+
+ggplot(df1, aes(pseudotime, exprs, group = cluster, colour = as.factor(cluster))) + 
+  geom_point() + 
+  scale_colour_brewer(name = "Cluster", palette = "Set1") + 
+  labs(x = "Pseudotime", y = "Expression") + 
+  theme_bw() + 
+  theme(aspect.ratio = 1)
+```
+
+#### Ontology
+
+Test for enrichment of KEGG pathways within each cluster:
+
+```{r}
+ens <- rowData(sc1)$gene_id[match(rownames(sp1), rownames(sc1))]
+
+ids <- mapIds(org.Mm.eg.db, keys = ens, column = "ENTREZID", keytype = "ENSEMBL")
+
+ids <- split(ids, sp1$cluster)
+
+res <- lapply(ids, function(x) calculateKEGG(query = x, subject = uni))
+
+plt <- list(
+  visualiseKEGG(res$`1`, n = 10) + ggtitle("Cluster 1 - KEGG Pathway"),
+  visualiseKEGG(res$`2`, n = 10) + ggtitle("Cluster 2 - KEGG Pathway"),
+  visualiseKEGG(res$`3`, n = 10) + ggtitle("Cluster 3 - KEGG Pathway")
+)
+
+patchwork::wrap_plots(plt, ncol = 1)
+```
+
+### Lineage 2
+
+#### Clustering
+
+Extract association test results from experiment metadata:
+
+```{r}
+res <- metadata(sce)$associationTest
+```
+
+Create data frame of association test results for slingPseudotime_2 lineage:
+
+```{r}
+sp2 <- data.frame(
+  waldStat = res$slingPseudotime_2$waldStat_2, 
+  df = res$slingPseudotime_2$df_2, 
+  pvalue = res$slingPseudotime_2$pvalue_2, 
+  fdr = p.adjust(res$slingPseudotime_2$pvalue_2, method = "fdr"),
+  row.names = rownames(res$slingPseudotime_2)
+)
+```
+
+Reorder experiment data by slingPseudotime_2 lineage:
+
+```{r}
+sc2 <- reorder(sce, subset = rownames(sp2), select = sce$slingPseudotime_2)
+
+use <- !is.na(sc2$slingPseudotime_2)
+
+sc2 <- sc2[, use]
+```
+
+Cluster expression patterns of significant genes in slingPseudotime_2 lineage:
+
+```{r}
+set.seed(525499208)
+
+km2 <- kmeans(x = assay(sc2, "rescaled"), centers = 3)
+
+sp2$cluster <- km2$cluster[rownames(sp2)]
+```
+
+Plot clustered expression patterns to see how they behave across the slingPseudotime_2 lineage:
+
+```{r}
+clust.centroid <- function(i, assay, cluster) {
+  ind <- (cluster == i)
+  colMeans(assay[ind, ])
+}
+
+lvl <- unique(km2$cluster)
+
+df2 <- sapply(lvl, clust.centroid, assay(sc2, "rescaled"), km2$cluster)
+
+df2 <- melt(df2)
+
+colnames(df2) <- c("cell", "cluster", "exprs")
+
+df2$pseudotime <- sc2$slingPseudotime_2[df2$cell]
+
+ggplot(df2, aes(pseudotime, exprs, group = cluster, colour = as.factor(cluster))) + 
+  geom_point() + 
+  scale_colour_brewer(name = "Cluster", palette = "Set1") + 
+  labs(x = "Pseudotime", y = "Expression") + 
+  theme_bw() + 
+  theme(aspect.ratio = 1)
+```
+
+#### Ontology
+
+Test for enrichment of KEGG pathways within each cluster:
+
+```{r}
+ens <- rowData(sc2)$gene_id[match(rownames(sp2), rownames(sc2))]
+
+ids <- mapIds(org.Mm.eg.db, keys = ens, column = "ENTREZID", keytype = "ENSEMBL")
+
+ids <- split(ids, sp2$cluster)
+
+res <- lapply(ids, function(x) calculateKEGG(query = x, subject = uni))
+
+plt <- list(
+  visualiseKEGG(res$`1`, n = 10) + ggtitle("Cluster 1 - KEGG Pathway"),
+  visualiseKEGG(res$`2`, n = 10) + ggtitle("Cluster 2 - KEGG Pathway"),
+  visualiseKEGG(res$`3`, n = 10) + ggtitle("Cluster 3 - KEGG Pathway")
+)
+
+patchwork::wrap_plots(plt, ncol = 1)
+```

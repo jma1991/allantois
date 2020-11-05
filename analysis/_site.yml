@@ -1,17 +1,34 @@
-name: "allantois"
+name: allantois
 output_dir: ../docs
 navbar:
-  title: "allantois"
+  title: allantois
   left:
   - text: Home
     href: index.html
   - text: About
     href: about.html
-  - text: License
-    href: license.html
+  - text: Analysis
+    menu:
+    - text: Allantois correction
+      href: 01-allantois-correction.html
+    - text: Atlas integration
+      href: 02-atlas-integration.html
+    - text: Trajectory analysis
+      href: 03-trajectory-analysis.html
+    - text: Differential analysis
+      href: 04-differential-analysis.html
+    - text: Gene ontology
+      href: 05-gene-ontology.html
+    - text: Trajectory modules
+      href: 09-trajectory-modules.Rmd
+  right:
+  - icon: fa-github
+    text: Source code
+    href: https://github.com/jma1991/allantois
 output:
   workflowr::wflow_html:
     toc: yes
     toc_float: yes
     theme: cosmo
     highlight: textmate
+    df_print: paged

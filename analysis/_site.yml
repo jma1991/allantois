@@ -22,9 +22,10 @@ navbar:
     - text: Trajectory modules
       href: 09-trajectory-modules.Rmd
   right:
-  - icon: fa-github
-    text: Source code
-    href: https://github.com/jma1991/allantois
+    - text: License
+    - href: license.html
+    - icon: fa-github
+      href: https://github.com/jma1991/allantois
 output:
   workflowr::wflow_html:
     toc: yes

@@ -277,7 +277,7 @@ ggplot(df1, aes(pseudotime, exprs, group = cluster, colour = as.factor(cluster))
 
 Test for enrichment of KEGG pathways within each cluster:
 
-```{r}
+```{r fig.width = 8, fig.height = 10}
 ens <- rowData(sc1)$gene_id[match(rownames(sp1), rownames(sc1))]
 
 ids <- mapIds(org.Mm.eg.db, keys = ens, column = "ENTREZID", keytype = "ENSEMBL")
@@ -286,11 +286,11 @@ ids <- split(ids, sp1$cluster)
 
 res <- lapply(ids, function(x) calculateKEGG(query = x, subject = uni))
 
-plt <- list(
-  visualiseKEGG(res$`1`, n = 10) + ggtitle("Cluster 1 - KEGG Pathway"),
-  visualiseKEGG(res$`2`, n = 10) + ggtitle("Cluster 2 - KEGG Pathway"),
-  visualiseKEGG(res$`3`, n = 10) + ggtitle("Cluster 3 - KEGG Pathway")
-)
+res <- Filter(nrow, res)
+
+lvl <- names(res)
+
+plt <- lapply(lvl, function(x) visualiseKEGG(res[[x]], n = 10) + ggtitle(paste0("Cluster ", x, " - KEGG Pathway")))
 
 patchwork::wrap_plots(plt, ncol = 1)
 ```
@@ -367,7 +367,7 @@ ggplot(df2, aes(pseudotime, exprs, group = cluster, colour = as.factor(cluster))
 
 Test for enrichment of KEGG pathways within each cluster:
 
-```{r}
+```{r fig.width = 8, fig.height = 4}
 ens <- rowData(sc2)$gene_id[match(rownames(sp2), rownames(sc2))]
 
 ids <- mapIds(org.Mm.eg.db, keys = ens, column = "ENTREZID", keytype = "ENSEMBL")
@@ -376,11 +376,11 @@ ids <- split(ids, sp2$cluster)
 
 res <- lapply(ids, function(x) calculateKEGG(query = x, subject = uni))
 
-plt <- list(
-  visualiseKEGG(res$`1`, n = 10) + ggtitle("Cluster 1 - KEGG Pathway"),
-  visualiseKEGG(res$`2`, n = 10) + ggtitle("Cluster 2 - KEGG Pathway"),
-  visualiseKEGG(res$`3`, n = 10) + ggtitle("Cluster 3 - KEGG Pathway")
-)
+res <- Filter(nrow, res)
+
+lvl <- names(res)
+
+plt <- lapply(lvl, function(x) visualiseKEGG(res[[x]], n = 10) + ggtitle(paste0("Cluster ", x, " - KEGG Pathway")))
 
 patchwork::wrap_plots(plt, ncol = 1)
 ```
